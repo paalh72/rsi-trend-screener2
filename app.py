@@ -16,21 +16,19 @@ if 'results' not in st.session_state:
 # --- HJELPEFUNKSJONER ---
 @st.cache_data(ttl=24*3600)
 def get_sp500_tickers():
-    """Prøver å hente S&P 500 fra Wikipedia. Bruker backup-liste ved feil."""
+    """Henter S&P 500 eller bruker backup."""
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     try:
         tables = pd.read_html(url)
         df = tables[0]
         tickers = df['Symbol'].tolist()
         return [t.replace('.', '-') for t in tickers]
-    except Exception as e:
-        # Fallback liste hvis scraping feiler (De 50 største)
+    except Exception:
+        # Fallback liste
         return [
             "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "BRK-B", "UNH", "JNJ",
             "XOM", "JPM", "PG", "V", "LLY", "HD", "MA", "CVX", "MRK", "ABBV", 
-            "PEP", "KO", "BAC", "AVGO", "COST", "PFE", "TMO", "WMT", "CSCO", "MCD",
-            "DIS", "ABT", "CRM", "ACN", "LIN", "DHR", "ADBE", "VZ", "NEE", "CMCSA",
-            "TXN", "NKE", "PM", "BMY", "NFLX", "RTX", "WFC", "HON", "UPS", "INTC"
+            "PEP", "KO", "BAC", "AVGO", "COST", "PFE", "TMO", "WMT", "CSCO", "MCD", "DIS"
         ]
 
 def get_oslo_tickers():
@@ -51,9 +49,7 @@ def get_stock_data(tickers, period="5y"):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Håndtering hvis listen er tom
-    if not tickers:
-        return {}, {}
+    if not tickers: return {}, {}
 
     for i, ticker in enumerate(tickers):
         status_text.text(f"Laster data {i+1}/{len(tickers)}: {ticker}")
@@ -72,14 +68,31 @@ def get_stock_data(tickers, period="5y"):
     return data, infos
 
 def calculate_technical_indicators(df):
+    """
+    Beregner RSI med Wilder's Smoothing (Standard for TradingView/Nordnet).
+    Dette gir mer korrekte signaler enn vanlig glidende snitt.
+    """
     df = df.copy()
+    
+    # RSI Beregning (Wilder's Smoothing)
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    
+    # Separer oppgang og nedgang
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # Bruk ewm (Exponential Weighted Moving Average) for å etterligne Wilder's
+    # com = window - 1. For RSI 14 er com=13.
+    avg_gain = gain.ewm(com=13, adjust=False).mean()
+    avg_loss = loss.ewm(com=13, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
     df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # SMA
     df['SMA50'] = df['Close'].rolling(window=50).mean()
     df['SMA200'] = df['Close'].rolling(window=200).mean()
+    
     return df
 
 def find_trend_patterns(df, rsi_low, rsi_high, min_gain_pct, required_streak):
@@ -108,10 +121,12 @@ def find_trend_patterns(df, rsi_low, rsi_high, min_gain_pct, required_streak):
         
         elif state == 'in_bottom':
             if rsi < rsi_low:
+                # Vi er fortsatt i bunn-sonen, se etter lavere bunn
                 if price < local_min_price:
                     local_min_price = price
                     local_min_date = date
             else:
+                # RSI brøt opp fra bunn
                 current_cycle['BottomDate'] = local_min_date
                 current_cycle['BottomPrice'] = local_min_price
                 state = 'wait_for_top'
@@ -122,8 +137,9 @@ def find_trend_patterns(df, rsi_low, rsi_high, min_gain_pct, required_streak):
                 state = 'in_top'
                 local_max_price = price
                 local_max_date = date
+            
+            # Reset hvis RSI faller ned igjen uten å ha nådd toppen (falsk start)
             if rsi < rsi_low:
-                # Reset hvis vi faller ned igjen uten å nå toppen
                 state = 'in_bottom'
                 local_min_price = price
                 local_min_date = date
@@ -134,10 +150,11 @@ def find_trend_patterns(df, rsi_low, rsi_high, min_gain_pct, required_streak):
                     local_max_price = price
                     local_max_date = date
             else:
+                # Toppen er satt
                 current_cycle['TopDate'] = local_max_date
                 current_cycle['TopPrice'] = local_max_price
                 
-                # BRUKER NÅ VARIABEL FOR GEVINST
+                # Sjekk gevinstkravet
                 if current_cycle['TopPrice'] >= current_cycle['BottomPrice'] * (1 + min_gain_pct):
                     cycles.append(current_cycle.copy())
                 
@@ -145,30 +162,48 @@ def find_trend_patterns(df, rsi_low, rsi_high, min_gain_pct, required_streak):
                 current_cycle = {}
                 local_min_price = float('inf')
 
-    if len(cycles) < required_streak:
-        return 0, []
+    total_valid_cycles = len(cycles)
 
-    current_streak = 1
-    trend_cycles = [cycles[-1]]
+    # Hvis brukeren kun ber om 1 syklus (ingen trend-sammenligning kreves)
+    if required_streak == 0:
+        return 0, cycles, total_valid_cycles
+
+    if len(cycles) < 2:
+        # Har ikke nok sykluser til å sammenligne A mot B
+        return (1 if len(cycles)==1 else 0), cycles, total_valid_cycles
+
+    # Sjekk trend (sammenlign bakover)
+    current_streak = 0
+    trend_cycles = []
+    
+    # Vi starter fra siste syklus og går bakover
+    # Hvis siste syklus er del av en trend, teller vi den
+    
+    # Logikk: Finn lengste sammenhengende kjede på slutten
+    temp_cycles = [cycles[-1]]
+    temp_streak = 1
     
     for i in range(len(cycles) - 2, -1, -1):
-        curr = cycles[i+1] 
-        prev = cycles[i]   
+        curr = cycles[i+1] # Nyere
+        prev = cycles[i]   # Eldre
         
-        # Sjekk Trend-krav: Stigende bunner og topper
+        # Trend krav: Høyere bunn OG Høyere topp
         is_rising_bottom = curr['BottomPrice'] > prev['BottomPrice']
         is_rising_top = curr['TopPrice'] > prev['TopPrice']
         
         if is_rising_bottom and is_rising_top:
-            current_streak += 1
-            trend_cycles.insert(0, prev)
+            temp_streak += 1
+            temp_cycles.insert(0, prev)
         else:
-            break 
+            break # Trend brutt
             
-    if current_streak >= required_streak:
-        return current_streak, trend_cycles
-    else:
-        return 0, []
+    # Hvis kravet er 1 repetisjon (altså 1 trend-hopp: A -> B), må streak være >= 2 (som betyr 2 sykluser involvert)
+    # Men for å være snill med visningen: Hvis bruker velger "1", viser vi alt som har minst 1 syklus?
+    # Nei, bruker spurte om "repeterende". 
+    # La oss si: Streak tallet er antall "hopp".
+    # Egentlig er "Streak" i koden nå antall Sykluser i trenden.
+    
+    return temp_streak, temp_cycles, total_valid_cycles
 
 def filter_dataframe_by_period(df, period):
     if period == "5 år": return df
@@ -179,15 +214,7 @@ def filter_dataframe_by_period(df, period):
 
 # --- GUI ---
 
-st.title("📈 RSI Trend Screener")
-
-with st.sidebar.expander("ℹ️ Slik virker algoritmen", expanded=False):
-    st.markdown("""
-    Leter etter **stigende trender** bekreftet av RSI:
-    1.  **Syklus:** Bunn (RSI < grense) til Topp (RSI > grense).
-    2.  **Krav:** Hver topp må være X % høyere enn bunnen.
-    3.  **Trend:** Neste bunn må være høyere enn forrige bunn, og neste topp høyere enn forrige topp.
-    """)
+st.title("📈 RSI Trend Screener Pro")
 
 # 1. MENY
 st.sidebar.header("1. Innstillinger")
@@ -196,12 +223,8 @@ universe_choice = st.sidebar.radio("Marked:", ("Oslo Børs (Topp 50)", "S&P 500 
 tickers_list = []
 if universe_choice == "S&P 500 (USA)":
     tickers_list = get_sp500_tickers()
-    if len(tickers_list) < 100:
-        st.sidebar.warning("Kunne ikke hente full liste automatisk. Bruker backup-liste (Topp 50).")
-    
     limit = st.sidebar.slider("Begrens antall aksjer", 10, len(tickers_list), 50)
     tickers_list = tickers_list[:limit]
-    
 elif universe_choice == "Oslo Børs (Topp 50)":
     tickers_list = get_oslo_tickers()
 else:
@@ -210,67 +233,71 @@ else:
 
 st.sidebar.subheader("Filtrering")
 min_mcap_bn = st.sidebar.number_input("Min. Market Cap (Mrd)", value=0.1, step=0.1)
-trend_streak = st.sidebar.number_input("Antall repeterende mønstre", value=2, min_value=1)
 
-# NYTT: JUSTERBAR GEVINST
-min_gain_input = st.sidebar.number_input("Min. gevinst fra bunn til topp (%)", value=10.0, step=1.0)
+# Gevinst og Streak
+st.sidebar.markdown("---")
+st.sidebar.caption("Trend Kriterier")
+min_gain_input = st.sidebar.number_input("Min. % oppgang i hver syklus", value=5.0, step=1.0) # Satt ned default for test
 min_gain_decimal = min_gain_input / 100.0
+
+trend_streak_req = st.sidebar.number_input("Minimum antall sykluser i trend", value=1, min_value=1, help="1 = Vis alle med minst én godkjent syklus. 2 = Krever at syklus 2 er høyere enn syklus 1.")
 
 st.sidebar.subheader("RSI Grenser")
 col1, col2 = st.sidebar.columns(2)
-rsi_low_lim = col1.number_input("Bunn", value=30)
-rsi_high_lim = col2.number_input("Topp", value=70)
+rsi_low_lim = col1.number_input("Bunn (<)", value=30)
+rsi_high_lim = col2.number_input("Topp (>)", value=70)
 
 # 2. START
 if st.sidebar.button("🚀 Start Trend Analyse"):
-    if not tickers_list:
-        st.error("Ingen aksjer valgt. Sjekk internettforbindelse eller velg 'Egen liste'.")
+    st.write(f"Analyserer {len(tickers_list)} aksjer...")
+    st.session_state.results = None
+    data, infos = get_stock_data(tickers_list)
+    results = []
+    
+    prog = st.progress(0)
+    for i, (ticker, df) in enumerate(data.items()):
+        prog.progress((i+1)/len(data))
+        info = infos.get(ticker, {})
+        mcap = info.get('marketCap', 0) / 1e9
+        
+        if mcap < min_mcap_bn: continue
+        
+        df = calculate_technical_indicators(df)
+        
+        # Kjører algoritmen
+        streak, trend_cycles, total_cycles = find_trend_patterns(
+            df, 
+            rsi_low=rsi_low_lim, 
+            rsi_high=rsi_high_lim, 
+            min_gain_pct=min_gain_decimal,
+            required_streak=trend_streak_req
+        )
+        
+        # Hvis bruker setter streak=1, vil vi bare se at vi fant noe (streak >= 1)
+        if streak >= trend_streak_req:
+            results.append({
+                'Ticker': ticker, 
+                'Navn': info.get('shortName', ticker),
+                'Trend Lengde': streak,
+                'Fant Sykluser': total_cycles, # Ny kolonne for debugging
+                'Siste Pris': round(df['Close'].iloc[-1], 2),
+                '_df': df, 
+                '_cycles': trend_cycles
+            })
+    prog.empty()
+    
+    if results:
+        st.session_state.results = pd.DataFrame(results).sort_values('Trend Lengde', ascending=False)
+        st.success(f"Fant {len(results)} aksjer!")
     else:
-        st.write(f"Analyserer {len(tickers_list)} aksjer...")
-        st.session_state.results = None
-        data, infos = get_stock_data(tickers_list)
-        results = []
-        
-        prog = st.progress(0)
-        for i, (ticker, df) in enumerate(data.items()):
-            prog.progress((i+1)/len(data))
-            info = infos.get(ticker, {})
-            mcap = info.get('marketCap', 0) / 1e9
-            
-            if mcap < min_mcap_bn: continue
-            
-            df = calculate_technical_indicators(df)
-            
-            # Kjører algoritmen med brukerens gevinst-krav
-            streak, trend_cycles = find_trend_patterns(
-                df, 
-                rsi_low=rsi_low_lim, 
-                rsi_high=rsi_high_lim, 
-                min_gain_pct=min_gain_decimal,
-                required_streak=trend_streak
-            )
-            
-            if streak >= trend_streak:
-                results.append({
-                    'Ticker': ticker, 
-                    'Navn': info.get('shortName', ticker),
-                    'Trend Lengde': streak,
-                    'Siste Pris': round(df['Close'].iloc[-1], 2),
-                    '_df': df, 
-                    '_cycles': trend_cycles
-                })
-        prog.empty()
-        
-        if results:
-            st.session_state.results = pd.DataFrame(results).sort_values('Trend Lengde', ascending=False)
-            st.success(f"Fant {len(results)} aksjer som oppfyller kravene!")
-        else:
-            st.warning(f"Ingen aksjer funnet med {min_gain_input}% gevinstkrav og {trend_streak} repetisjoner.")
+        st.error("Ingen aksjer funnet. Tips: Prøv å justere RSI-grensene (f.eks 35 og 65) eller senk gevinstkravet.")
 
 # 3. VISNING
 if st.session_state.results is not None:
     res = st.session_state.results
-    st.dataframe(res[['Ticker', 'Navn', 'Trend Lengde', 'Siste Pris']])
+    
+    # Vis tabell med ny kolonne
+    st.dataframe(res[['Ticker', 'Navn', 'Trend Lengde', 'Fant Sykluser', 'Siste Pris']])
     
     st.markdown("---")
     c_sel, c_per = st.columns([3, 1])
@@ -284,7 +311,7 @@ if st.session_state.results is not None:
         
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                             vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                            subplot_titles=(f"{row['Navn']} - Trend Analyse", "RSI"))
+                            subplot_titles=(f"{row['Navn']} - Trend (Viser sykluser i trenden)", "RSI (Wilder's)"))
 
         # PRIS GRAF
         fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'], name='Kurs', line=dict(color='gray', width=1)), row=1, col=1)
@@ -294,6 +321,7 @@ if st.session_state.results is not None:
         valid_prices = [c['BottomPrice'] for c in trend_cycles if c['BottomDate'] >= df_plot.index[0]]
         
         if valid_dates:
+             # Grønn stiplet linje som binder bunnene sammen
              fig.add_trace(go.Scatter(x=valid_dates, y=valid_prices, mode='lines+markers', 
                                       line=dict(color='green', width=2, dash='dash'),
                                       marker=dict(size=10, symbol='triangle-up'),
@@ -312,10 +340,6 @@ if st.session_state.results is not None:
         fig.add_hline(y=rsi_high_lim, line_dash="dash", line_color="gray", row=2, col=1)
         fig.add_hline(y=rsi_low_lim, line_dash="dash", line_color="gray", row=2, col=1)
         
-        rsi_bottoms = df_plot.loc[valid_dates]['RSI'] if valid_dates else []
-        if len(rsi_bottoms) > 0:
-            fig.add_trace(go.Scatter(x=valid_dates, y=rsi_bottoms, mode='markers', marker=dict(color='green'), showlegend=False), row=2, col=1)
-
         fig.update_layout(height=600, margin=dict(t=40, b=20))
         fig.update_yaxes(range=[0, 100], row=2, col=1)
         st.plotly_chart(fig, use_container_width=True)
